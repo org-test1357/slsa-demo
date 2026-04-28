@@ -1,4 +1,4 @@
-name: SLSA Secure Build
+name: SLSA Secure Build + Artifact Metadata
 
 on:
   push:
@@ -9,27 +9,33 @@ permissions:
   packages: write
   id-token: write
   attestations: write
-  security-events: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Login to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
+      # -------------------------------
+      # METADATA
+      # -------------------------------
       - name: Extract metadata
         id: meta
         run: |
-          IMAGE=ghcr.io/${{ github.repository_owner }}/app
+          IMAGE=ghcr.io/${{ github.repository_owner }}/slsa-demo/app
           TAG=${{ github.sha }}
 
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
+      # -------------------------------
+      # BUILD + PUSH
+      # -------------------------------
       - name: Build and Push image
         id: build
         run: |
@@ -43,6 +49,9 @@ jobs:
           DIGEST=$(docker buildx imagetools inspect $IMAGE:$TAG --format '{{json .Manifest.Digest}}' | tr -d '"')
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
 
+      # -------------------------------
+      # SLSA PROVENANCE
+      # -------------------------------
       - name: Generate Provenance
         uses: actions/attest@v4
         with:
@@ -50,31 +59,34 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
+      # -------------------------------
+      # STORAGE RECORD (ORG LEVEL)
+      # -------------------------------
       - name: Create Storage Record
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.request('POST /repos/{owner}/{repo}/artifact-metadata/storage-records', {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              artifact_digest: '${{ steps.build.outputs.digest }}',
-              registry: 'ghcr',
-              registry_url: '${{ steps.meta.outputs.image }}',
-              tags: ['${{ steps.meta.outputs.tag }}']
-            })
+        run: |
+          curl -X POST https://api.github.com/orgs/${{ github.repository_owner }}/artifact-metadata/storage-records \
+            -H "Authorization: Bearer ${{ secrets.ORG_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -d '{
+              "digest": "${{ steps.build.outputs.digest }}",
+              "registry": "ghcr",
+              "registry_url": "${{ steps.meta.outputs.image }}",
+              "repository": "${{ github.repository }}"
+            }'
 
+      # -------------------------------
+      # DEPLOYMENT RECORD
+      # -------------------------------
       - name: Create Deployment Record
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.request('POST /repos/{owner}/{repo}/artifact-metadata/deployment-records', {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              artifact_digest: '${{ steps.build.outputs.digest }}',
-              environment: 'production',
-              deployment_target: 'demo-env',
-              runtime_risk: {
-                internet_exposed: true,
-                handles_sensitive_data: false
-              }
-            })
+        run: |
+          curl -X POST https://api.github.com/orgs/${{ github.repository_owner }}/artifact-metadata/deployment-records \
+            -H "Authorization: Bearer ${{ secrets.ORG_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -d '{
+              "name": "slsa-demo-app",
+              "digest": "${{ steps.build.outputs.digest }}",
+              "status": "deployed",
+              "logical_environment": "production",
+              "deployment_name": "prod-app",
+              "runtime_risks": ["internet-exposed"]
+            }'
