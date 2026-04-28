@@ -9,36 +9,72 @@ permissions:
   packages: write
   id-token: write
   attestations: write
+  security-events: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Log in to GHCR
+      - name: Login to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       - name: Extract metadata
         id: meta
         run: |
-          IMAGE=ghcr.io/${{github.repository_owner}}/${{ github.repository}}/app:${{ github.sha }}
-          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          IMAGE=ghcr.io/${{ github.repository_owner }}/app
+          TAG=${{ github.sha }}
 
-      - name: Build image
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Build and Push image
         id: build
         run: |
-          docker build -t ${{ steps.meta.outputs.image }}:latest .
-          docker push ${{ steps.meta.outputs.image }}:latest
+          IMAGE=${{ steps.meta.outputs.image }}
+          TAG=${{ steps.meta.outputs.tag }}
 
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ steps.meta.outputs.image }}:latest | cut -d@ -f2)
+          docker build -t $IMAGE:$TAG -t $IMAGE:latest .
+          docker push $IMAGE:$TAG
+          docker push $IMAGE:latest
+
+          DIGEST=$(docker buildx imagetools inspect $IMAGE:$TAG --format '{{json .Manifest.Digest}}' | tr -d '"')
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
 
-      - name: Generate SLSA Provenance
+      - name: Generate Provenance
         uses: actions/attest@v4
         with:
           subject-name: ${{ steps.meta.outputs.image }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+
+      - name: Create Storage Record
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.request('POST /repos/{owner}/{repo}/artifact-metadata/storage-records', {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_digest: '${{ steps.build.outputs.digest }}',
+              registry: 'ghcr',
+              registry_url: '${{ steps.meta.outputs.image }}',
+              tags: ['${{ steps.meta.outputs.tag }}']
+            })
+
+      - name: Create Deployment Record
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.request('POST /repos/{owner}/{repo}/artifact-metadata/deployment-records', {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_digest: '${{ steps.build.outputs.digest }}',
+              environment: 'production',
+              deployment_target: 'demo-env',
+              runtime_risk: {
+                internet_exposed: true,
+                handles_sensitive_data: false
+              }
+            })
