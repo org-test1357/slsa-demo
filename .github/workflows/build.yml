@@ -24,7 +24,7 @@ jobs:
       - name: Extract metadata
         id: meta
         run: |
-          IMAGE=ghcr.io/${{ github.repository }}/app
+          IMAGE=ghcr.io/${{ github.repository_owner }}/${{ github.repository }}/app
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
 
       - name: Build image
