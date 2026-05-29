@@ -1,92 +1,138 @@
-name: SLSA Secure Build + Artifact Metadata
+name: Code to Cloud Visibility POC
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
 
 permissions:
   contents: read
   packages: write
   id-token: write
   attestations: write
+  artifact-metadata: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/app
+  IMAGE_REF: ghcr.io/${{ github.repository }}/app
 
 jobs:
-  build:
+  build-and-attest:
     runs-on: ubuntu-latest
+    outputs:
+      image_ref: ${{ env.IMAGE_REF }}
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Login to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # -------------------------------
-      # METADATA
-      # -------------------------------
-      - name: Extract metadata
-        id: meta
-        run: |
-          IMAGE=ghcr.io/${{ github.repository_owner }}/slsa-demo/app
-          TAG=${{ github.sha }}
-
-          echo "image=$IMAGE" >> $GITHUB_OUTPUT
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-
-      # -------------------------------
-      # BUILD + PUSH
-      # -------------------------------
-      - name: Build and Push image
+      - name: Build and push image
         id: build
-        run: |
-          IMAGE=${{ steps.meta.outputs.image }}
-          TAG=${{ steps.meta.outputs.tag }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_REF }}:latest
+            ${{ env.IMAGE_REF }}:${{ github.sha }}
 
-          docker build -t $IMAGE:$TAG -t $IMAGE:latest .
-          docker push $IMAGE:$TAG
-          docker push $IMAGE:latest
-
-          DIGEST=$(docker buildx imagetools inspect $IMAGE:$TAG --format '{{json .Manifest.Digest}}' | tr -d '"')
-          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
-
-      # -------------------------------
-      # SLSA PROVENANCE
-      # -------------------------------
-      - name: Generate Provenance
+      - name: Generate SLSA provenance attestation
         uses: actions/attest@v4
         with:
-          subject-name: ${{ steps.meta.outputs.image }}
+          subject-name: ${{ env.IMAGE_REF }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
-      # -------------------------------
-      # STORAGE RECORD (ORG LEVEL)
-      # -------------------------------
-      - name: Create Storage Record
+      # Optional: only keep this if you want an explicit/manual storage record
+      # instead of relying on automatic storage-record creation.
+      - name: Create storage record (optional manual fallback)
+        env:
+          ORG: ${{ github.repository_owner }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_REF: ${{ env.IMAGE_REF }}
         run: |
-          curl -X POST https://api.github.com/orgs/${{ github.repository_owner }}/artifact-metadata/storage-records \
-            -H "Authorization: Bearer ${{ secrets.ORG_TOKEN }}" \
+          curl -L \
+            -X POST \
             -H "Accept: application/vnd.github+json" \
-            -d '{
-              "digest": "${{ steps.build.outputs.digest }}",
-              "registry": "ghcr",
-              "registry_url": "${{ steps.meta.outputs.image }}",
-              "repository": "${{ github.repository }}"
-            }'
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            https://api.github.com/orgs/${ORG}/artifacts/metadata/storage-record \
+            -d @- <<EOF
+          {
+            "name": "${IMAGE_REF}",
+            "digest": "${DIGEST}",
+            "version": "${GITHUB_SHA}",
+            "artifact_url": "https://${IMAGE_REF}@${DIGEST}",
+            "registry_url": "https://ghcr.io",
+            "repository": "${{ github.repository }}/app",
+            "status": "active",
+            "return_records": true
+          }
+          EOF
 
-      # -------------------------------
-      # DEPLOYMENT RECORD
-      # -------------------------------
-      - name: Create Deployment Record
+  record-deployment:
+    runs-on: ubuntu-latest
+    needs: build-and-attest
+
+    steps:
+      - name: Create deployment record
+        env:
+          ORG: ${{ github.repository_owner }}
+          IMAGE_REF: ${{ needs.build-and-attest.outputs.image_ref }}
+          DIGEST: ${{ needs.build-and-attest.outputs.digest }}
         run: |
-          curl -X POST https://api.github.com/orgs/${{ github.repository_owner }}/artifact-metadata/deployment-records \
-            -H "Authorization: Bearer ${{ secrets.ORG_TOKEN }}" \
+          curl -L \
+            -X POST \
             -H "Accept: application/vnd.github+json" \
-            -d '{
-              "name": "slsa-demo-app",
-              "digest": "${{ steps.build.outputs.digest }}",
-              "status": "deployed",
-              "logical_environment": "production",
-              "deployment_name": "prod-app",
-              "runtime_risks": ["internet-exposed"]
-            }'
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            https://api.github.com/orgs/${ORG}/artifacts/metadata/deployment-record \
+            -d @- <<EOF
+          {
+            "name": "${IMAGE_REF}",
+            "digest": "${DIGEST}",
+            "version": "${GITHUB_SHA}",
+            "status": "deployed",
+            "logical_environment": "dev",
+            "physical_environment": "south-india",
+            "cluster": "aks-dev-01",
+            "deployment_name": "default-app-app",
+            "runtime_risks": ["internet-exposed"],
+            "tags": {
+              "namespace": "default",
+              "workload": "deployment/app",
+              "commit": "${GITHUB_SHA}"
+            },
+            "return_records": true
+          }
+          EOF
+
+      - name: Verify storage records
+        env:
+          ORG: ${{ github.repository_owner }}
+          DIGEST: ${{ needs.build-and-attest.outputs.digest }}
+        run: |
+          curl -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            https://api.github.com/orgs/${ORG}/artifacts/${DIGEST}/metadata/storage-records
+
+      - name: Verify deployment records
+        env:
+          ORG: ${{ github.repository_owner }}
+          DIGEST: ${{ needs.build-and-attest.outputs.digest }}
+        run: |
+          curl -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            https://api.github.com/orgs/${ORG}/artifacts/${DIGEST}/metadata/deployment-records
